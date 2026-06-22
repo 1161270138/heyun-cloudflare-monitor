@@ -1,0 +1,15 @@
+{
+  "name": "heyun-cloudflare-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy:worker": "wrangler deploy --config wrangler.toml",
+    "deploy:pages": "wrangler pages deploy pages --project-name heyun-monitor-pages",
+    "test": "node --check src/worker.js && node --check pages/_worker.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
