@@ -48,6 +48,12 @@ jobs:
           node-version: 22
       - run: npm install
       - run: npm test
+      - name: Ensure Pages project
+        run: npx wrangler pages project create "${CLOUDFLARE_PAGES_PROJECT:-heyun-monitor-pages}" --production-branch main || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ secrets.CLOUDFLARE_PAGES_PROJECT }}
       - name: Deploy Pages
         run: |
           node -e "const fs=require('fs');const p='wrangler.pages.toml';let s=fs.readFileSync(p,'utf8');s=s.replace('REPLACE_WITH_KV_NAMESPACE_ID', process.env.CLOUDFLARE_KV_NAMESPACE_ID);fs.writeFileSync(p,s);"
