@@ -364,12 +364,12 @@ async function zjmfRequest(account, path, init = {}) {
   const jwt = await login(account);
   const res = await fetch(normalizeBase(account.api_base_url) + path, {
     ...init,
-    headers: { ...(init.headers || {}), Authorization: `JWT ${jwt}` },
+    headers: { Accept: "application/json", ...(init.headers || {}), Authorization: `JWT ${jwt}` },
+    cf: { cacheTtl: 0 },
   });
   const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = { message: text }; }
-  if (!res.ok) throw new Error(data.msg || data.message || `HTTP ${res.status}`);
+  const data = parseMaybeJson(text);
+  if (!res.ok) throw new Error(zjmfErrorMessage("请求核云接口", res.status, data, text));
   return data;
 }
 
@@ -377,10 +377,16 @@ async function login(account) {
   const url = new URL(normalizeBase(account.api_base_url) + "/login_api");
   url.searchParams.set("account", account.api_account);
   url.searchParams.set("password", account.api_password);
-  const res = await fetch(url, { method: "POST" });
-  const data = await res.json();
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    cf: { cacheTtl: 0 },
+  });
+  const text = await res.text();
+  const data = parseMaybeJson(text);
+  if (!res.ok) throw new Error(zjmfErrorMessage("登录核云 API", res.status, data, text));
   const jwt = data.jwt || data.data?.jwt;
-  if (!jwt) throw new Error(data.msg || data.message || "登录失败，未返回 JWT");
+  if (!jwt) throw new Error(data.msg || data.message || data.error || `登录失败，未返回 JWT。接口返回：${compactText(text)}`);
   return jwt;
 }
 
@@ -428,6 +434,20 @@ function normalizeBase(value) { const v = String(value || "https://www.heyunidc.
 function nowIso() { return new Date().toISOString().slice(0, 19); }
 function nowHms() { return new Date().toISOString().slice(11, 19); }
 function humanError(error) { return String(error?.message || error); }
+function parseMaybeJson(text) {
+  try { return JSON.parse(text); } catch { return { message: compactText(text) }; }
+}
+function compactText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
+}
+function zjmfErrorMessage(action, status, data, text) {
+  const body = compactText(data?.msg || data?.message || data?.error || text);
+  if (status === 522 || /error code:\s*522/i.test(body)) {
+    return `${action}失败：核云 API 返回 522，Cloudflare 连接核云源站超时。请稍后重试；如果一直这样，说明核云接口不适合直接从 Cloudflare Worker 访问，需要改用本地监控或加一个国内/普通服务器中转。`;
+  }
+  if (status === 401 || status === 403) return `${action}失败：账号或 API 密钥可能不正确，HTTP ${status}，${body}`;
+  return `${action}失败：HTTP ${status}${body ? `，${body}` : ""}`;
+}
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", ...headers } });
 }
