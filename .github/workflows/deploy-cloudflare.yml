@@ -33,6 +33,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+      - name: Set optional Worker relay secrets
+        run: |
+          if [ -n "$HEYUN_RELAY_URL" ]; then printf '%s' "$HEYUN_RELAY_URL" | npx wrangler secret put HEYUN_RELAY_URL --config wrangler.toml; fi
+          if [ -n "$HEYUN_RELAY_TOKEN" ]; then printf '%s' "$HEYUN_RELAY_TOKEN" | npx wrangler secret put HEYUN_RELAY_TOKEN --config wrangler.toml; fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          HEYUN_RELAY_URL: ${{ secrets.HEYUN_RELAY_URL }}
+          HEYUN_RELAY_TOKEN: ${{ secrets.HEYUN_RELAY_TOKEN }}
       - name: Redeploy Worker with secrets
         run: npx wrangler deploy --config wrangler.toml
         env:
@@ -71,6 +80,16 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PAGES_PROJECT: ${{ secrets.CLOUDFLARE_PAGES_PROJECT }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+      - name: Set optional Pages relay secrets
+        run: |
+          if [ -n "$HEYUN_RELAY_URL" ]; then printf '%s' "$HEYUN_RELAY_URL" | npx wrangler pages secret put HEYUN_RELAY_URL --project-name "${CLOUDFLARE_PAGES_PROJECT:-heyun-monitor-pages}"; fi
+          if [ -n "$HEYUN_RELAY_TOKEN" ]; then printf '%s' "$HEYUN_RELAY_TOKEN" | npx wrangler pages secret put HEYUN_RELAY_TOKEN --project-name "${CLOUDFLARE_PAGES_PROJECT:-heyun-monitor-pages}"; fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ secrets.CLOUDFLARE_PAGES_PROJECT }}
+          HEYUN_RELAY_URL: ${{ secrets.HEYUN_RELAY_URL }}
+          HEYUN_RELAY_TOKEN: ${{ secrets.HEYUN_RELAY_TOKEN }}
       - name: Redeploy Pages with secrets
         run: |
           cp wrangler.pages.toml wrangler.toml

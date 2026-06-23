@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "deploy:worker": "wrangler deploy --config wrangler.toml",
     "deploy:pages": "wrangler pages deploy pages --project-name heyun-monitor-pages",
-    "test": "node --check src/worker.js && node --check pages/_worker.js"
+    "relay": "node relay/heyun-relay.js",
+    "test": "node --check src/worker.js && node --check pages/_worker.js && node --check relay/heyun-relay.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

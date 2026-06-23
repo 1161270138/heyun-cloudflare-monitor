@@ -166,7 +166,7 @@ async function runMonitor(env, { force = false } = {}) {
     if (!account) continue;
     const started = Date.now();
     try {
-      const power = await getPower(account, host.id);
+      const power = await getPower(env, account, host.id);
       const powerLower = String(power).toLowerCase();
       const healthy = ONLINE_VALUES.has(powerLower);
       const oldPower = String(runtime.power || "").toLowerCase();
@@ -238,7 +238,7 @@ async function apiAction(env, body) {
 
 async function runPowerAction(env, state, host, account, action, reason) {
   if (!ACTION_PATHS[action]) throw new Error("不支持的动作");
-  const result = await zjmfRequest(account, ACTION_PATHS[action].replace("{id}", encodeURIComponent(host.id)), { method: "PUT" });
+  const result = await zjmfRequest(env, account, ACTION_PATHS[action].replace("{id}", encodeURIComponent(host.id)), { method: "PUT" });
   const key = hostKey(host.provider, host.id);
   const runtime = state.hosts[key] || {};
   runtime.last_action = action;
@@ -264,7 +264,7 @@ async function addAccount(env, body) {
   if (!existing) config.accounts.push({ ...account, id: provider });
   else if (account.api_password) existing.api_password = account.api_password;
 
-  const hosts = await listHosts({ ...account, id: provider });
+  const hosts = await listHosts(env, { ...account, id: provider });
   const existingIds = new Set(config.hosts.map((h) => h.id));
   let imported = 0;
   const skipped = [];
@@ -329,12 +329,12 @@ async function deleteHost(env, body) {
   return { ok: true };
 }
 
-async function listHosts(account) {
+async function listHosts(env, account) {
   const limit = 100;
   let page = 1;
   const hosts = [];
   while (true) {
-    const data = await zjmfRequest(account, `/hosts?page=${page}&limit=${limit}`);
+    const data = await zjmfRequest(env, account, `/hosts?page=${page}&limit=${limit}`);
     const raw = data.data;
     let batch = [];
     let total = null;
@@ -353,14 +353,15 @@ async function listHosts(account) {
   return hosts;
 }
 
-async function getPower(account, id) {
-  const data = await zjmfRequest(account, `/hosts/${encodeURIComponent(id)}/module/status?type=host`);
+async function getPower(env, account, id) {
+  const data = await zjmfRequest(env, account, `/hosts/${encodeURIComponent(id)}/module/status?type=host`);
   if (Number(data.status) >= 400) throw new Error(data.msg || data.message || `API status ${data.status}`);
   const raw = data.data;
   return raw?.status || raw?.state || raw?.power_status || raw?.power_state || data.state || data.power_status || data.status;
 }
 
-async function zjmfRequest(account, path, init = {}) {
+async function zjmfRequest(env, account, path, init = {}) {
+  if (env.HEYUN_RELAY_URL) return zjmfRelayRequest(env, account, path, init);
   const jwt = await login(account);
   const res = await fetch(normalizeBase(account.api_base_url) + path, {
     ...init,
@@ -371,6 +372,34 @@ async function zjmfRequest(account, path, init = {}) {
   const data = parseMaybeJson(text);
   if (!res.ok) throw new Error(zjmfErrorMessage("请求核云接口", res.status, data, text));
   return data;
+}
+
+async function zjmfRelayRequest(env, account, path, init = {}) {
+  const relayUrl = normalizeRelayUrl(env.HEYUN_RELAY_URL);
+  if (!relayUrl) throw new Error("HEYUN_RELAY_URL 未配置");
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (env.HEYUN_RELAY_TOKEN) headers.Authorization = `Bearer ${env.HEYUN_RELAY_TOKEN}`;
+  const res = await fetch(relayUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      api_base_url: normalizeBase(account.api_base_url),
+      api_account: account.api_account,
+      api_password: account.api_password,
+      path,
+      method: init.method || "GET",
+      body: init.body || null,
+    }),
+  });
+  const text = await res.text();
+  const data = parseMaybeJson(text);
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || data.msg || data.message || zjmfErrorMessage("请求核云中转", res.status, data, text));
+  }
+  return data.data || data;
 }
 
 async function login(account) {
@@ -431,6 +460,13 @@ function hostKey(provider, id) { return `${provider}:${id}`; }
 function cleanId(value) { return String(value || "").replace(/[^\w-]/g, "_").slice(0, 32) || crypto.randomUUID(); }
 function uniqueId(base, used) { let id = base; let i = 2; while (used.has(id)) id = `${base}_${i++}`; return id; }
 function normalizeBase(value) { const v = String(value || "https://www.heyunidc.cn/v1").replace(/\/$/, ""); return v.endsWith("/v1") ? v : `${v}/v1`; }
+function normalizeRelayUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const url = new URL(raw);
+  if (url.pathname === "/" || !url.pathname) url.pathname = "/zjmf";
+  return url.toString();
+}
 function nowIso() { return new Date().toISOString().slice(0, 19); }
 function nowHms() { return new Date().toISOString().slice(11, 19); }
 function humanError(error) { return String(error?.message || error); }
