@@ -22,7 +22,16 @@ const OFF_VALUES = new Set(["off", "shutdown", "stopped"]);
 
 export default {
   async fetch(request, env, ctx) {
-    return handleRequest(request, env, ctx);
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (error) {
+      const url = new URL(request.url);
+      const status = error?.status || 400;
+      if (url.pathname.startsWith("/api/")) {
+        return json({ ok: false, error: humanError(error) }, status);
+      }
+      return html(`<!doctype html><meta charset="utf-8"><title>错误</title><pre>${escapeHtml(humanError(error))}</pre>`, status);
+    }
   },
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(runMonitor(env, { force: false }));
@@ -121,6 +130,7 @@ async function snapshot(env) {
   });
   return {
     ok: true,
+    last_poll_at: state.last_poll_at || "",
     summary: {
       total: hosts.length,
       online: hosts.filter((h) => h.status === "online").length,
@@ -193,6 +203,7 @@ async function runMonitor(env, { force = false } = {}) {
     }
   }
 
+  state.last_poll_at = nowIso();
   await putState(env, state);
   return snapshot(env);
 }
@@ -259,6 +270,11 @@ async function addAccount(env, body) {
   const skipped = [];
   for (const h of hosts) {
     const id = String(h.id || h.host_id || "");
+    const productStatus = String(h.domainstatus || "").toLowerCase();
+    if (productStatus && !["active", "on", "running"].includes(productStatus)) {
+      skipped.push({ id, name: h.product_name || h.name || h.domain || id || "-", reason: `非 Active 状态：${productStatus}` });
+      continue;
+    }
     if (!id || existingIds.has(id)) {
       if (id) skipped.push({ id, name: h.product_name || h.name || h.domain || id, reason: "重复服务器" });
       continue;
@@ -314,10 +330,27 @@ async function deleteHost(env, body) {
 }
 
 async function listHosts(account) {
-  const data = await zjmfRequest(account, "/hosts?page=1&limit=100");
-  const raw = data.data;
-  if (Array.isArray(raw)) return raw;
-  return raw?.host || raw?.list || raw?.data || [];
+  const limit = 100;
+  let page = 1;
+  const hosts = [];
+  while (true) {
+    const data = await zjmfRequest(account, `/hosts?page=${page}&limit=${limit}`);
+    const raw = data.data;
+    let batch = [];
+    let total = null;
+    if (Array.isArray(raw)) {
+      batch = raw;
+    } else if (raw && typeof raw === "object") {
+      batch = raw.host || raw.list || raw.data || [];
+      total = raw.total;
+    }
+    batch = batch.filter((item) => item && typeof item === "object");
+    hosts.push(...batch);
+    if (!batch.length || batch.length < limit) break;
+    if (total && hosts.length >= Number(total)) break;
+    page += 1;
+  }
+  return hosts;
 }
 
 async function getPower(account, id) {
@@ -398,20 +431,247 @@ function humanError(error) { return String(error?.message || error); }
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", ...headers } });
 }
-function html(body) { return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } }); }
+function html(body, status = 200) { return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } }); }
+function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
 function loginPage() {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录</title><style>${css()}</style><body><main class="login"><form id="f" class="card small"><h1>核云监控</h1><p>输入管理密码</p><input name="password" type="password" placeholder="登录密码" autofocus><button>登录</button><div id="msg"></div></form></main><script>f.onsubmit=async e=>{e.preventDefault();const r=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))});const j=await r.json();if(j.ok)location='/';else msg.textContent=j.error||'登录失败'}</script></body></html>`;
 }
 
 function dashboardPage() {
-  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>核云监控</title><style>${css()}</style><body><header><div><h1>核云监控</h1><p>ZJMF · Cloudflare</p></div><button onclick="fetch('/api/logout',{method:'POST'}).then(()=>location='/login')">退出</button></header><main><section class="metrics"><div>总监控<b id="mTotal">0</b></div><div>在线<b id="mOnline">0</b></div><div>离线<b id="mOffline">0</b></div><div>错误<b id="mErrors">0</b></div></section><section class="layout"><div id="servers" class="grid"></div><aside class="panel"><h2>账号管理</h2><form id="accountForm"><input name="name" placeholder="账号名称"><input name="api_base_url" placeholder="API 地址，默认核云"><input name="api_account" placeholder="登录邮箱或手机号"><input name="api_password" type="password" placeholder="API 密钥"><button>添加账号并导入服务器</button></form><div id="accounts"></div><h2>事件流</h2><div id="events"></div></aside></section></main><script>${clientJs()}</script></body></html>`;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>核云监控</title>
+  <style>${css()}</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo">核</div>
+      <div>
+        <h1>核云监控</h1>
+        <div class="sub">ZJMF 电源状态监控 · 自动恢复 · Cloudflare</div>
+      </div>
+    </div>
+    <div class="topbar">
+      <span class="pill"><span id="globalDot" class="dot"></span><span id="globalText">连接中</span></span>
+      <span class="pill">账号：<b id="accountCount">-</b></span>
+      <span class="pill">上次检查：<b id="lastPoll">-</b></span>
+      <button id="pollBtn" type="button">立即检测</button>
+      <button id="logoutBtn" type="button">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="notice" class="notice hidden"></div>
+    <section class="metrics">
+      <div class="metric"><span>总监控</span><strong id="mTotal">0</strong></div>
+      <div class="metric"><span>在线</span><strong id="mOnline">0</strong></div>
+      <div class="metric"><span>离线</span><strong id="mOffline">0</strong></div>
+      <div class="metric"><span>错误</span><strong id="mErrors">0</strong></div>
+    </section>
+
+    <section class="layout">
+      <div id="servers" class="grid"></div>
+      <aside class="panel">
+        <h2>账号管理</h2>
+        <div class="settings">
+          <form id="accountForm">
+            <div class="form-grid">
+              <input name="name" placeholder="账号名称，例如 备用账号">
+              <input name="api_base_url" placeholder="API 地址，默认核云">
+            </div>
+            <input name="api_account" placeholder="登录邮箱或手机号" autocomplete="username">
+            <input name="api_password" type="password" placeholder="API 密钥" autocomplete="current-password">
+            <button type="submit">添加账号并导入服务器</button>
+          </form>
+          <div id="accounts" class="accounts"></div>
+        </div>
+        <h2>事件流</h2>
+        <div id="events" class="events"></div>
+      </aside>
+    </section>
+  </main>
+  <script>${clientJs()}</script>
+</body>
+</html>`;
 }
 
 function css() {
-  return `:root{color-scheme:dark;--bg:#070b10;--card:#111a24;--line:rgba(148,163,184,.18);--text:#e7edf2;--muted:#8fa0ad;--ok:#20d19b;--bad:#f06464;--warn:#f0b35b}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,rgba(32,209,155,.12),transparent 34rem),var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}header{display:flex;justify-content:space-between;align-items:center;padding:18px 36px;border-bottom:1px solid var(--line);background:rgba(7,11,16,.85);position:sticky;top:0}h1{margin:0;font-size:18px}p{color:var(--muted)}main{padding:24px 36px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.metrics div,.card,.panel{border:1px solid var(--line);background:linear-gradient(180deg,rgba(17,26,36,.96),rgba(11,17,24,.96));border-radius:8px;padding:16px}.metrics b{display:block;font-size:28px;margin-top:8px}.layout{display:grid;grid-template-columns:1fr 360px;gap:18px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}.head{display:flex;justify-content:space-between;gap:12px}.badge{border:1px solid var(--line);border-radius:999px;padding:5px 9px}.online{color:var(--ok)}.offline,.error{color:var(--bad)}.facts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.facts div{background:rgba(255,255,255,.04);border-radius:8px;padding:10px}.label{font-size:11px;color:var(--muted);margin-bottom:5px}input,select,button{width:100%;border:1px solid var(--line);background:#141f2b;color:var(--text);border-radius:8px;padding:9px 10px;font:inherit}button{cursor:pointer;width:auto}.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.danger{border-color:rgba(240,100,100,.55)}.warn{border-color:rgba(240,179,91,.55)}.host-settings{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);padding-top:12px}.span-2{grid-column:1/-1}.host-settings button{grid-column:1/-1;justify-self:end}.event{padding:10px 0;border-bottom:1px solid var(--line)}.event .meta{font-size:11px;color:var(--muted)}.login{min-height:100vh;display:grid;place-items:center}.small{width:min(360px,calc(100vw - 32px))}@media(max-width:900px){.layout,.metrics{grid-template-columns:1fr}.host-settings{grid-template-columns:1fr}}`;
+  return `:root{color-scheme:dark;--bg:#070b10;--panel:#0d141d;--card:#111a24;--line:rgba(148,163,184,.18);--text:#e7edf2;--muted:#8fa0ad;--ok:#20d19b;--bad:#ef4444;--warn:#f59e0b;--blue:#60a5fa;--field:#162232;--shadow:0 20px 60px rgba(0,0,0,.22)}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,rgba(32,209,155,.12),transparent 34rem),linear-gradient(180deg,#070b10,#07110f 60%,#070b10);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px clamp(16px,4vw,44px);border-bottom:1px solid var(--line);background:rgba(7,11,16,.86);backdrop-filter:blur(14px);position:sticky;top:0;z-index:2}.brand{display:flex;align-items:center;gap:12px}.logo{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;color:#05100d;font-weight:900;background:linear-gradient(135deg,var(--blue),var(--ok))}h1{margin:0;font-size:18px;line-height:1.1}.sub{color:var(--muted);font-size:12px;margin-top:4px}.topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 11px;border:1px solid var(--line);border-radius:999px;background:rgba(13,20,29,.74);color:var(--muted);font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);box-shadow:0 0 18px currentColor}.dot.ok{background:var(--ok);color:var(--ok)}.dot.warn{background:var(--warn);color:var(--warn)}.dot.bad{background:var(--bad);color:var(--bad)}main{padding:22px clamp(16px,4vw,44px) 44px}.notice{margin-bottom:14px;border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:rgba(96,165,250,.12);color:#dbeafe}.notice.bad{background:rgba(239,68,68,.12);color:#fecaca}.notice.ok{background:rgba(32,209,155,.12);color:#bbf7d0}.hidden{display:none}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.metric{border:1px solid var(--line);border-radius:8px;background:linear-gradient(180deg,rgba(17,26,36,.86),rgba(13,20,29,.86));box-shadow:var(--shadow);padding:16px}.metric span{color:var(--muted);font-size:12px}.metric strong{display:block;font-size:28px;margin-top:8px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px;align-items:start}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}.card{border:1px solid var(--line);border-radius:8px;background:linear-gradient(180deg,rgba(17,26,36,.94),rgba(11,17,24,.96));padding:16px;overflow:hidden;box-shadow:var(--shadow)}.server-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.server-title{min-width:0}.server-title h2{margin:0;font-size:16px;overflow-wrap:anywhere}.server-title p{margin:6px 0 0;color:var(--muted);font-size:12px}.badge{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;font-size:12px;border:1px solid var(--line);background:rgba(255,255,255,.04)}.badge.online{color:var(--ok)}.badge.offline,.badge.error{color:#fecaca}.facts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0}.fact{padding:10px;border-radius:8px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.035)}.fact label{display:block;color:var(--muted);font-size:11px;margin-bottom:6px}.fact b{font-size:14px;overflow-wrap:anywhere}.spark{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;align-items:end;gap:3px;height:44px;padding:6px;border-radius:8px;background:rgba(0,0,0,.22)}.bar{min-width:3px;border-radius:3px 3px 0 0;background:var(--bad);height:18%;opacity:.95}.bar.ok{background:var(--ok);height:80%}.actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}.card-settings{margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,.07)}.strategy-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;color:var(--muted);font-size:12px}.host-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.host-settings>div{min-width:0}.host-settings .span-2{grid-column:1/-1}.host-settings button[type=submit]{grid-column:1/-1;justify-self:end;min-width:92px}.settings{display:grid;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06)}.settings form{display:grid;gap:10px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}input,select{width:100%;min-width:0;border:1px solid rgba(148,163,184,.18);color:var(--text);background:var(--field);border-radius:8px;padding:9px 10px;font:inherit;font-size:13px}input::placeholder{color:#64748b}input:focus,select:focus{outline:none;border-color:rgba(32,209,155,.56);box-shadow:0 0 0 3px rgba(32,209,155,.10)}.label{color:var(--muted);font-size:11px;margin-bottom:5px}.accounts{display:grid;gap:7px}.account-row{display:flex;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:8px;background:rgba(255,255,255,.035);font-size:12px}.account-row span{color:var(--muted)}button{cursor:pointer;border:1px solid var(--line);color:var(--text);background:rgba(255,255,255,.045);border-radius:8px;padding:9px 11px;font:inherit;font-size:13px}button:hover{border-color:var(--blue)}button:disabled{opacity:.58;cursor:not-allowed}button.danger{border-color:rgba(239,68,68,.46);color:#fecaca}button.warn{border-color:rgba(245,158,11,.46);color:#fde68a}.panel{border:1px solid var(--line);border-radius:8px;background:rgba(13,20,29,.82);overflow:hidden;box-shadow:var(--shadow)}.panel h2{margin:0;padding:15px 16px;font-size:15px;border-bottom:1px solid var(--line)}.events{max-height:540px;overflow:auto}.event{padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.06)}.event:last-child{border-bottom:0}.event .meta{color:var(--muted);font-size:11px;margin-bottom:5px}.event.warning{border-left:3px solid var(--warn)}.event.error{border-left:3px solid var(--bad)}.event.action{border-left:3px solid var(--blue)}.empty{color:var(--muted);padding:18px}.login{min-height:100vh;display:grid;place-items:center}.small{width:min(360px,calc(100vw - 32px))}@media(max-width:900px){header{align-items:flex-start;flex-direction:column}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.layout{grid-template-columns:1fr}.host-settings{grid-template-columns:1fr 1fr}}@media(max-width:520px){.metrics,.facts{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.host-settings{grid-template-columns:1fr}.host-settings .span-2,.host-settings button[type=submit]{grid-column:1}}`;
 }
 
 function clientJs() {
-  return `const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])),fmt=a=>({power_on:'开机',hard_off:'硬关机',reboot:'重启',hard_reboot:'硬重启'}[a]||a||'-');async function api(p,o){const r=await fetch(p,o),j=await r.json().catch(()=>({}));if(!r.ok||j.ok===false)throw Error(j.error||('HTTP '+r.status));return j}function host(h){const interval=String(h.interval_seconds||60),sel=(v,c)=>v===c?'selected':'';return '<article class="card"><div class="head"><div><b>'+esc(h.name||h.id)+'</b><p>'+esc(h.provider_name||h.provider)+' · #'+esc(h.id)+' · '+esc(h.ip||'无IP')+'</p></div><span class="badge '+esc(h.status)+'">'+esc(h.status)+'</span></div><div class="facts"><div><div class="label">电源</div><b>'+esc(h.power)+'</b></div><div><div class="label">延迟</div><b>'+(h.last_latency_ms??'-')+' ms</b></div><div><div class="label">异常</div><b>'+esc(h.failures||0)+'</b></div><div><div class="label">最近动作</div><b>'+esc(fmt(h.last_action))+'</b></div></div><div class="actions"><button data-action="power_on" data-host="'+esc(h.key)+'">开机</button><button class="warn" data-action="hard_off" data-host="'+esc(h.key)+'">硬关机</button><button data-action="reboot" data-host="'+esc(h.key)+'">重启</button><button class="danger" data-action="hard_reboot" data-host="'+esc(h.key)+'">硬重启</button><button class="danger" data-delete-host="'+esc(h.key)+'">删除监控</button></div><form class="host-settings" data-host-settings="'+esc(h.key)+'"><div><div class="label">服务器ID</div><input name="server_id" value="'+esc(h.id)+'"></div><div><div class="label">账号名称</div><input name="provider_name" value="'+esc(h.provider_name||h.provider)+'"></div><div class="span-2"><div class="label">登录账号</div><input name="api_account" value="'+esc(h.api_account||'')+'"></div><div class="span-2"><div class="label">API密钥</div><input name="api_password" type="password" placeholder="'+(h.has_api_password?'已配置，留空不改':'请输入API密钥')+'"></div><div><div class="label">检测间隔</div><select name="interval_seconds">'+[10,30,60,180,300,600].map(v=>'<option value="'+v+'" '+sel(String(v),interval)+'>'+({10:'10 秒',30:'30 秒',60:'1 分钟',180:'3 分钟',300:'5 分钟',600:'10 分钟'}[v])+'</option>').join('')+'</select></div><div><div class="label">自动恢复</div><select name="auto_enabled"><option value="true" '+(h.auto_enabled!==false?'selected':'')+'>开启</option><option value="false" '+(h.auto_enabled===false?'selected':'')+'>关闭</option></select></div><div><div class="label">离线动作</div><select name="auto_action"><option value="hard_reboot" '+sel('hard_reboot',h.auto_action)+'>硬重启</option><option value="reboot" '+sel('reboot',h.auto_action)+'>重启</option><option value="power_on" '+sel('power_on',h.auto_action)+'>开机</option></select></div><button>保存</button></form></article>'}function render(d){mTotal.textContent=d.summary.total;mOnline.textContent=d.summary.online;mOffline.textContent=d.summary.offline;mErrors.textContent=d.summary.errors;servers.innerHTML=d.hosts.map(host).join('')||'<div class="card">暂无服务器</div>';accounts.innerHTML=d.accounts.map(a=>'<p><b>'+esc(a.name)+'</b> '+esc(a.api_account)+' · '+a.host_count+' 台</p>').join('');events.innerHTML=d.events.map(e=>'<div class="event"><div class="meta">'+esc(e.time)+' · '+esc(e.provider||'')+' #'+esc(e.host_id||'')+'</div>'+esc(e.message)+'</div>').join('')}async function refresh(){render(await api('/api/status'))}document.addEventListener('click',async e=>{const del=e.target.closest('[data-delete-host]');if(del){if(!confirm('删除监控项？不会删除云服务器。'))return;await api('/api/host-delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({host_key:del.dataset.deleteHost})});return refresh()}const b=e.target.closest('[data-action]');if(!b)return;if(!confirm('确定执行 '+fmt(b.dataset.action)+'？'))return;await api('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({host_key:b.dataset.host,action:b.dataset.action})});refresh()});document.addEventListener('submit',async e=>{const f=e.target;if(f.id==='accountForm'){e.preventDefault();const r=await api('/api/accounts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))});alert('导入 '+r.imported+' 台，跳过 '+(r.skipped_count||0)+' 台重复');f.reset();return refresh()}if(f.dataset.hostSettings){e.preventDefault();const b=Object.fromEntries(new FormData(f));await api('/api/host-settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...b,host_key:f.dataset.hostSettings,interval_seconds:Number(b.interval_seconds),auto_enabled:b.auto_enabled==='true'})});return refresh()}});refresh();setInterval(refresh,3000);`;
+  return `
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const fmtAction = (a) => ({power_on:'开机', hard_off:'硬关机', reboot:'重启', hard_reboot:'硬重启'}[a] || a || '-');
+let busy = false;
+
+function notice(message, type) {
+  const el = $('notice');
+  el.textContent = message || '';
+  el.className = message ? 'notice ' + (type || '') : 'notice hidden';
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+  if (!res.ok || data.ok === false) throw new Error(data.error || data.message || ('HTTP ' + res.status));
+  return data;
+}
+
+function renderSpark(history) {
+  const rows = (history || []).slice(-40);
+  if (!rows.length) return '<div class="empty">暂无历史</div>';
+  return rows.map((x) => '<span class="bar '+(x.v ? 'ok' : '')+'" title="'+esc(x.t)+'"></span>').join('');
+}
+
+function renderHost(h) {
+  const status = h.status || 'unknown';
+  const dotClass = status === 'online' ? 'ok' : status === 'offline' ? 'bad' : 'warn';
+  const latency = h.last_latency_ms == null ? '-' : h.last_latency_ms + ' ms';
+  const selected = (value, current) => value === current ? 'selected' : '';
+  const autoEnabled = h.auto_enabled !== false;
+  const autoAction = h.auto_action || 'hard_reboot';
+  const interval = String(h.interval_seconds || 60);
+  return '<article class="card">'
+    + '<div class="server-head"><div class="server-title"><h2>'+esc(h.name || h.id)+'</h2><p>'+esc(h.provider_name || h.provider || '账号')+' · #'+esc(h.id)+' · '+esc(h.ip || '无 IP')+'</p></div><span class="badge '+esc(status)+'"><span class="dot '+dotClass+'"></span>'+esc(status)+'</span></div>'
+    + '<div class="facts"><div class="fact"><label>电源状态</label><b>'+esc(h.power || '-')+'</b></div><div class="fact"><label>接口延迟</label><b>'+esc(latency)+'</b></div><div class="fact"><label>连续异常</label><b>'+esc(h.failures || 0)+'</b></div><div class="fact"><label>最近动作</label><b>'+esc(fmtAction(h.last_action))+'</b></div></div>'
+    + '<div class="spark">'+renderSpark(h.history)+'</div>'
+    + '<div class="actions"><button data-action="power_on" data-host="'+esc(h.key)+'">开机</button><button class="warn" data-action="hard_off" data-host="'+esc(h.key)+'">硬关机</button><button data-action="reboot" data-host="'+esc(h.key)+'">重启</button><button class="danger" data-action="hard_reboot" data-host="'+esc(h.key)+'">硬重启</button><button class="danger" data-delete-host="'+esc(h.key)+'">删除监控</button></div>'
+    + '<div class="card-settings"><div class="strategy-title"><b>监控策略</b><span>下次异常按本卡片策略处理</span></div>'
+    + '<form class="host-settings" data-host-settings="'+esc(h.key)+'">'
+    + '<div><div class="label">服务器 ID</div><input name="server_id" value="'+esc(h.id || '')+'"></div>'
+    + '<div><div class="label">账号名称</div><input name="provider_name" value="'+esc(h.provider_name || h.provider || '')+'"></div>'
+    + '<div class="span-2"><div class="label">登录账号</div><input name="api_account" value="'+esc(h.api_account || '')+'" autocomplete="username"></div>'
+    + '<div class="span-2"><div class="label">API 密钥</div><input name="api_password" type="password" placeholder="'+(h.has_api_password ? '已配置，留空不改' : '请输入 API 密钥')+'" autocomplete="current-password"></div>'
+    + '<div><div class="label">检测间隔</div><select name="interval_seconds">'
+    + [10,30,60,180,300,600].map((v) => '<option value="'+v+'" '+selected(String(v), interval)+'>'+({10:'10 秒',30:'30 秒',60:'1 分钟',180:'3 分钟',300:'5 分钟',600:'10 分钟'}[v])+'</option>').join('')
+    + '</select></div>'
+    + '<div><div class="label">自动恢复</div><select name="auto_enabled"><option value="true" '+(autoEnabled ? 'selected' : '')+'>开启</option><option value="false" '+(!autoEnabled ? 'selected' : '')+'>关闭</option></select></div>'
+    + '<div><div class="label">离线动作</div><select name="auto_action"><option value="hard_reboot" '+selected('hard_reboot', autoAction)+'>硬重启</option><option value="reboot" '+selected('reboot', autoAction)+'>重启</option><option value="power_on" '+selected('power_on', autoAction)+'>开机</option></select></div>'
+    + '<button type="submit">保存</button></form></div>'
+    + (h.last_error ? '<p class="sub">错误：'+esc(h.last_error)+'</p>' : '')
+    + '</article>';
+}
+
+function renderEvents(events) {
+  if (!events || !events.length) return '<div class="empty">暂无事件</div>';
+  const levelText = {info:'信息', warning:'警告', error:'错误', action:'操作'};
+  return events.map((e) => '<div class="event '+esc(e.level)+'"><div class="meta">'+esc(e.time)+' '+(e.provider ? '· '+esc(e.provider) : '')+(e.host_id ? ' · #'+esc(e.host_id) : '')+' · '+esc(levelText[e.level] || e.level)+'</div><div>'+esc(e.message)+'</div></div>').join('');
+}
+
+function renderAccounts(accounts) {
+  if (!accounts || !accounts.length) return '<div class="empty">暂无账号</div>';
+  return accounts.map((a) => '<div class="account-row"><b>'+esc(a.name || a.id)+'</b><span>'+esc(a.api_account || '')+' · '+esc(a.host_count || 0)+' 台</span></div>').join('');
+}
+
+function render(data) {
+  $('mTotal').textContent = data.summary.total;
+  $('mOnline').textContent = data.summary.online;
+  $('mOffline').textContent = data.summary.offline;
+  $('mErrors').textContent = data.summary.errors;
+  $('lastPoll').textContent = data.last_poll_at || '-';
+  $('accountCount').textContent = (data.accounts || []).length;
+  const bad = data.summary.offline || data.summary.errors;
+  $('globalDot').className = 'dot ' + (bad ? 'bad' : 'ok');
+  $('globalText').textContent = bad ? '需要关注' : '全部正常';
+  $('servers').innerHTML = (data.hosts || []).map(renderHost).join('') || '<div class="empty">暂无服务器</div>';
+  $('events').innerHTML = renderEvents(data.events);
+  $('accounts').innerHTML = renderAccounts(data.accounts);
+}
+
+async function refresh() {
+  try {
+    render(await api('/api/status'));
+  } catch (err) {
+    $('globalDot').className = 'dot bad';
+    $('globalText').textContent = '连接失败';
+    notice('连接失败：' + err.message, 'bad');
+  }
+}
+
+document.addEventListener('click', async (e) => {
+  const delBtn = e.target.closest('button[data-delete-host]');
+  if (delBtn && !busy) {
+    const hostKey = delBtn.dataset.deleteHost;
+    if (!confirm('确定删除监控项 ' + hostKey + '？这不会删除核云服务器。')) return;
+    busy = true; delBtn.disabled = true; notice('正在删除监控项...');
+    try {
+      await api('/api/host-delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host_key:hostKey})});
+      notice('已删除监控项', 'ok');
+      await refresh();
+    } catch (err) { notice(err.message, 'bad'); alert(err.message); }
+    finally { busy = false; delBtn.disabled = false; }
+    return;
+  }
+
+  const btn = e.target.closest('button[data-action]');
+  if (!btn || busy) return;
+  const action = btn.dataset.action;
+  const hostKey = btn.dataset.host;
+  if (!confirm('确定对 ' + hostKey + ' 执行' + fmtAction(action) + '？')) return;
+  busy = true; btn.disabled = true; notice('正在发送' + fmtAction(action) + '指令...');
+  try {
+    await api('/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host_key:hostKey, action})});
+    notice('已发送' + fmtAction(action) + '指令', 'ok');
+    await refresh();
+  } catch (err) { notice(err.message, 'bad'); alert(err.message); }
+  finally { busy = false; btn.disabled = false; }
+});
+
+document.addEventListener('submit', async (e) => {
+  const form = e.target.closest('form[data-host-settings]');
+  if (!form) return;
+  e.preventDefault();
+  const b = Object.fromEntries(new FormData(form));
+  notice('正在保存服务器设置...');
+  try {
+    await api('/api/host-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({host_key:form.dataset.hostSettings, server_id:b.server_id || '', provider_name:b.provider_name || '', api_account:b.api_account || '', api_password:b.api_password || '', interval_seconds:Number(b.interval_seconds || 60), auto_enabled:b.auto_enabled === 'true', auto_action:b.auto_action || 'hard_reboot'})});
+    notice('服务器设置已保存', 'ok');
+    await refresh();
+  } catch (err) { notice(err.message, 'bad'); alert(err.message); }
+});
+
+$('accountForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const b = Object.fromEntries(new FormData(e.target));
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  notice('正在登录核云并导入服务器...');
+  try {
+    const res = await api('/api/accounts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b)});
+    e.target.reset();
+    const msg = '已导入 ' + res.imported + ' 台服务器，跳过 ' + (res.skipped_count || 0) + ' 台。';
+    notice(msg, res.imported ? 'ok' : '');
+    alert(msg + (res.skipped && res.skipped.length ? '\\n' + res.skipped.slice(0, 5).map((x) => x.id + '：' + x.reason).join('\\n') : ''));
+    await refresh();
+  } catch (err) {
+    notice('导入失败：' + err.message, 'bad');
+    alert('导入失败：' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('pollBtn').addEventListener('click', async () => {
+  $('pollBtn').disabled = true;
+  notice('正在立即检测所有服务器...');
+  try {
+    render(await api('/api/poll', {method:'POST'}));
+    notice('检测完成', 'ok');
+  } catch (err) { notice('检测失败：' + err.message, 'bad'); alert(err.message); }
+  finally { $('pollBtn').disabled = false; }
+});
+
+$('logoutBtn').addEventListener('click', () => fetch('/api/logout', {method:'POST'}).then(() => location='/login'));
+refresh();
+setInterval(refresh, 3000);
+`;
 }
